@@ -54,7 +54,7 @@
 ./tiler -c conf.toml -p http://proxy-server:8080
 
 # 带认证的代理
-./tiler -c conf.toml -p socks5://user:Mima=001@47.254.236.163:1080
+./tiler -c conf.toml -p socks5://user:passwrd@ip:1080
 
 # 断点续传 + 代理组合使用
 ./tiler -c conf.toml -r output/dir -p socks5://proxy:1080
