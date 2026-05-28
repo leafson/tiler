@@ -19,11 +19,15 @@ import (
 var (
 	hf bool
 	cf string
+	rf string
+	pf string
 )
 
 func init() {
 	flag.BoolVar(&hf, "h", false, "this help")
 	flag.StringVar(&cf, "c", "conf.toml", "set config `file`")
+	flag.StringVar(&rf, "r", "", "resume download from existing directory")
+	flag.StringVar(&pf, "p", "", "set proxy URL (e.g., socks5://user:pass@host:port)")
 	// 改变默认的 Usage，flag包中的Usage 其实是一个函数类型。这里是覆盖默认函数实现，具体见后面Usage部分的分析
 	flag.Usage = usage
 	//InitLog 初始化日志
@@ -39,7 +43,7 @@ func init() {
 }
 func usage() {
 	fmt.Fprintf(os.Stderr, `tiler version: tiler/v0.1.0
-Usage: tiler [-h] [-c filename]
+Usage: tiler [-h] [-c filename] [-r directory] [-p proxy]
 `)
 	flag.PrintDefaults()
 }
@@ -208,7 +212,7 @@ func main() {
 			layers = append(layers, layer)
 		}
 	}
-	task := NewTask(layers, tm)
+	task := NewTask(layers, tm, rf, pf)
 	fmt.Println(task.workerCount)
 	task.Download()
 	secs := time.Since(start).Seconds()

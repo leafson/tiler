@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -51,22 +52,29 @@ type Task struct {
 	savingpipe         chan Tile
 	tileSet            Set
 	outformat          string
+	resumeDir          string
+	proxyURL           string
+	failedCount        int64
+	successCount       int64
+	failedLogFile      *os.File
 }
 
 // NewTask 创建下载任务
-func NewTask(layers []Layer, m TileMap) *Task {
+func NewTask(layers []Layer, m TileMap, resumeDir string, proxyURL string) *Task {
 	if len(layers) == 0 {
 		return nil
 	}
 	id, _ := shortid.Generate()
 
 	task := Task{
-		ID:      id,
-		Name:    m.Name,
-		Layers:  layers,
-		Min:     m.Min,
-		Max:     m.Max,
-		TileMap: m,
+		ID:        id,
+		Name:      m.Name,
+		Layers:    layers,
+		Min:       m.Min,
+		Max:       m.Max,
+		TileMap:   m,
+		resumeDir: resumeDir,
+		proxyURL:  proxyURL,
 	}
 
 	for i := 0; i < len(layers); i++ {
@@ -90,7 +98,33 @@ func NewTask(layers []Layer, m TileMap) *Task {
 	task.tileSet = Set{M: make(maptile.Set)}
 
 	task.outformat = viper.GetString("output.format")
+
+	// 初始化失败日志文件
+	task.initFailedLogFile()
+
 	return &task
+}
+
+// initFailedLogFile 初始化失败日志文件
+func (task *Task) initFailedLogFile() {
+	outdir := viper.GetString("output.directory")
+	os.MkdirAll(outdir, os.ModePerm)
+	logFile := filepath.Join(outdir, fmt.Sprintf("%s-failed.log", task.ID))
+	var err error
+	task.failedLogFile, err = os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Warnf("Failed to create failed log file: %v", err)
+	}
+}
+
+// logFailedTile 记录失败瓦片到日志文件
+func (task *Task) logFailedTile(z, x, y int, reason string) {
+	if task.failedLogFile != nil {
+		logEntry := fmt.Sprintf("[%s] Failed tile: z=%d, x=%d, y=%d, reason: %s\n",
+			time.Now().Format("2006-01-02 15:04:05"), z, x, y, reason)
+		task.failedLogFile.WriteString(logEntry)
+	}
+	task.failedCount++
 }
 
 // Bound 范围
@@ -231,28 +265,66 @@ func (task *Task) saveTile(tile Tile) error {
 }
 
 // tileFetcher 瓦片加载器
-func (task *Task) tileFetcher(mt maptile.Tile, url string) {
-	start := time.Now()
+func (task *Task) tileFetcher(mt maptile.Tile, tileURL string) {
 	defer task.tileWG.Done() //结束该瓦片请求
 	defer func() {
 		<-task.workers //workers完成并清退
 	}()
 
-	prep := func(t maptile.Tile, url string) string {
-		url = strings.Replace(url, "{x}", strconv.Itoa(int(t.X)), -1)
-		url = strings.Replace(url, "{y}", strconv.Itoa(int(t.Y)), -1)
+	// 如果是断点续传模式，检查瓦片是否已存在
+	if task.resumeDir != "" {
+		if task.outformat == "mbtiles" {
+			// 对于mbtiles格式，检查数据库中是否已存在
+			if tileExistsInDB(task.db, mt) {
+				// 不输出日志，保持界面简洁
+				return
+			}
+		} else {
+			// 对于文件格式，检查文件是否已存在
+			if tileExistsInFile(task.resumeDir, mt, task.TileMap.Format) {
+				// 不输出日志，保持界面简洁
+				return
+			}
+		}
+	}
+
+	prep := func(t maptile.Tile, urlStr string) string {
+		urlStr = strings.Replace(urlStr, "{x}", strconv.Itoa(int(t.X)), -1)
+		urlStr = strings.Replace(urlStr, "{y}", strconv.Itoa(int(t.Y)), -1)
 		maxY := int(math.Pow(2, float64(t.Z))) - 1
-		url = strings.Replace(url, "{-y}", strconv.Itoa(maxY-int(t.Y)), -1)
-		url = strings.Replace(url, "{z}", strconv.Itoa(int(t.Z)), -1)
-		return url
+		urlStr = strings.Replace(urlStr, "{-y}", strconv.Itoa(maxY-int(t.Y)), -1)
+		urlStr = strings.Replace(urlStr, "{z}", strconv.Itoa(int(t.Z)), -1)
+		return urlStr
 	}
-	tile := prep(mt, url)
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// 自定义重定向的行为
-			return http.ErrUseLastResponse // 使用最后一个响应
-		},
+	tile := prep(mt, tileURL)
+
+	// 创建HTTP客户端，支持代理
+	var client *http.Client
+	if task.proxyURL != "" {
+		proxyUrl, err := url.Parse(task.proxyURL)
+		if err != nil {
+			log.Errorf("Failed to parse proxy URL: %v", err)
+			return
+		}
+		transport := &http.Transport{
+			Proxy: http.ProxyURL(proxyUrl),
+		}
+		client = &http.Client{
+			Transport: transport,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// 自定义重定向的行为
+				return http.ErrUseLastResponse // 使用最后一个响应
+			},
+		}
+	} else {
+		client = &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// 自定义重定向的行为
+				return http.ErrUseLastResponse // 使用最后一个响应
+			},
+		}
 	}
+
 	req, err := http.NewRequest("GET", tile, nil)
 	if err != nil {
 		fmt.Println("创建请求失败:", err)
@@ -275,16 +347,16 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 	// }
 	// defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Errorf("fetch %v tile error, status code: %d ~", tile, resp.StatusCode)
+		task.logFailedTile(int(mt.Z), int(mt.X), int(mt.Y), fmt.Sprintf("status code: %d", resp.StatusCode))
 		return
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Errorf("read %v tile error ~ %s", mt, err)
+		task.logFailedTile(int(mt.Z), int(mt.X), int(mt.Y), fmt.Sprintf("read error: %s", err))
 		return
 	}
 	if len(body) == 0 {
-		log.Warnf("nil tile %v ~", mt)
+		task.logFailedTile(int(mt.Z), int(mt.X), int(mt.Y), "empty tile")
 		return //zero byte tiles n
 	}
 	// tiledata
@@ -314,8 +386,8 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 		task.saveTile(td)
 	}
 
-	cost := time.Since(start).Milliseconds()
-	log.Infof("tile(z:%d, x:%d, y:%d), %dms , %.2f kb, %s ...\n", mt.Z, mt.X, mt.Y, cost, float32(len(body))/1024.0, tile)
+	task.successCount++
+	// 不再输出每个瓦片的详细信息，只在进度条中体现
 }
 
 // DownloadZoom 下载指定层级
@@ -337,6 +409,8 @@ func (task *Task) downloadLayer(layer Layer) {
 			time.Sleep(time.Duration(task.timeDelay) * time.Millisecond)
 			bar.Increment()
 			task.Bar.Increment()
+			// 更新进度条前缀显示统计信息
+			task.Bar.Prefix(fmt.Sprintf("Task [Success: %d, Failed: %d] : ", task.successCount, task.failedCount))
 			task.tileWG.Add(1)
 			go task.tileFetcher(tile, layer.URL)
 		case <-task.abort:
@@ -365,12 +439,41 @@ func (task *Task) Download() {
 	// task.Bar.SetRefreshRate(10 * time.Second)
 	// task.Bar.Format("<.- >")
 	task.Bar.Start()
+
 	if task.outformat == "mbtiles" {
-		task.SetupMBTileTables()
+		// 如果是断点续传模式且指定了目录，尝试打开现有数据库
+		if task.resumeDir != "" {
+			if task.File == "" {
+				// 如果resumeDir是mbtiles文件路径，直接使用
+				if filepath.Ext(task.resumeDir) == ".mbtiles" {
+					task.File = task.resumeDir
+				} else {
+					// 否则在resumeDir下查找mbtiles文件
+					outdir := viper.GetString("output.directory")
+					task.File = filepath.Join(outdir, fmt.Sprintf("%s-z%d-%d.%s.mbtiles", task.Name, task.Min, task.Max, task.ID))
+				}
+			}
+			// 尝试打开现有数据库
+			if _, err := os.Stat(task.File); err == nil {
+				db, err := sql.Open("sqlite3", task.File)
+				if err == nil {
+					task.db = db
+					optimizeConnection(db)
+				}
+			}
+		}
+		if task.db == nil {
+			task.SetupMBTileTables()
+		}
 	} else {
 		if task.File == "" {
-			outdir := viper.GetString("output.directory")
-			task.File = filepath.Join(outdir, fmt.Sprintf("%s-z%d-%d.%s", task.Name, task.Min, task.Max, task.ID))
+			if task.resumeDir != "" {
+				// 如果提供了resumeDir，使用它作为输出目录
+				task.File = task.resumeDir
+			} else {
+				outdir := viper.GetString("output.directory")
+				task.File = filepath.Join(outdir, fmt.Sprintf("%s-z%d-%d.%s", task.Name, task.Min, task.Max, task.ID))
+			}
 		}
 		os.MkdirAll(task.File, os.ModePerm)
 	}
@@ -378,5 +481,10 @@ func (task *Task) Download() {
 	for _, layer := range task.Layers {
 		task.downloadLayer(layer)
 	}
-	task.Bar.FinishPrint(fmt.Sprintf("Task %s finished ~", task.ID))
+	task.Bar.FinishPrint(fmt.Sprintf("Task %s finished ~ Success: %d, Failed: %d", task.ID, task.successCount, task.failedCount))
+
+	// 关闭失败日志文件
+	if task.failedLogFile != nil {
+		task.failedLogFile.Close()
+	}
 }

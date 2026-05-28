@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -32,7 +33,7 @@ func saveToFiles(tile Tile, task *Task) error {
 	if err != nil {
 		return err
 	}
-	log.Println(fileName)
+	// 移除详细日志输出，保持界面简洁
 	return nil
 }
 
@@ -180,4 +181,27 @@ func getZoomCount(g orb.Geometry, minz int, maxz int) map[int]int64 {
 		info[z] = tilecover.GeometryCount(g, maptile.Zoom(z))
 	}
 	return info
+}
+
+// tileExistsInDB 检查瓦片是否已存在于数据库中
+func tileExistsInDB(db *sql.DB, tile maptile.Tile) bool {
+	var count int
+	// 计算翻转后的Y坐标
+	maxY := int(math.Pow(2, float64(tile.Z))) - 1
+	flippedY := maxY - int(tile.Y)
+
+	err := db.QueryRow("SELECT COUNT(*) FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
+		tile.Z, tile.X, flippedY).Scan(&count)
+	if err != nil {
+		log.Warnf("Error checking tile existence: %v", err)
+		return false
+	}
+	return count > 0
+}
+
+// tileExistsInFile 检查瓦片文件是否已存在
+func tileExistsInFile(baseDir string, tile maptile.Tile, format string) bool {
+	filePath := filepath.Join(baseDir, fmt.Sprintf(`%d`, tile.Z), fmt.Sprintf(`%d`, tile.X), fmt.Sprintf(`%d.%s`, tile.Y, format))
+	_, err := os.Stat(filePath)
+	return err == nil
 }
